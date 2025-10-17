@@ -10,10 +10,11 @@ const {
   ButtonStyle,
   ActionRowBuilder,
   Events,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  MessageFlags
 } = require("discord.js");
 const express = require("express");
-const { createClient } = require("@libsql/client");
+const mysql = require("mysql2/promise");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,11 +25,21 @@ const OWNER_ID = "360974094457503744";
 const COOLDOWN_DIAS = 45;
 
 // Channels where bot is allowed to operate
-const BOT_ALLOW_CHANNELS = ["1389033193063321680", "1362639865446924308"];
+const BOT_ALLOW_CHANNELS = ["1389033193063321680", "1362639865446924308", "1428767438199324753"];
 
-const pool = createClient({
-  url: process.env.DATABASE_URL,
-  authToken: process.env.TURSO_AUTH_TOKEN
+const pool = mysql.createPool({
+  host: process.env.MYSQL_HOST,
+  port: process.env.MYSQL_PORT || 3306,
+  user: process.env.MYSQL_USER,
+  password: process.env.MYSQL_PASSWORD,
+  database: process.env.MYSQL_DATABASE,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  // keep big numbers and dates as strings so you don’t lose precision
+  supportBigNumbers: true,
+  bigNumberStrings: true,
+  dateStrings: true
 });
 
 if (!DISCORD_TOKEN || !CLIENT_ID) {
@@ -118,22 +129,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!BOT_ALLOW_CHANNELS.includes(interaction.channelId)) {
         return interaction.reply({
           content: "❌ Este comando solo se puede usar en el canal <#1389033193063321680>.",
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
       }
 
       const { commandName, user, memberPermissions } = interaction;
 
       if (commandName === "replay-status") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-        const result = await pool.execute({
-          sql: "SELECT * FROM uploads WHERE user_id = ?",
-          args: [user.id]
-        });
-        const replay = result.rows[0];
+        const [rows] = await pool.execute("SELECT * FROM uploads WHERE user_id = ?", [user.id]);
+        const replay = rows[0];
 
         if (!replay) {
+          console.log(`No se ha subido ningun replay para ${user.name}`);
           return interaction.editReply(
             "✅ Aún no has subido ningún replay. ¡Puedes enviar uno ahora!"
           );
@@ -163,7 +172,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const target = interaction.options.getUser("usuario", true);
-        await pool.execute({ sql: "DELETE FROM uploads WHERE user_id = ?", args: [target.id] });
+        await pool.execute("DELETE FROM uploads WHERE user_id = ?", [target.id]);
         return interaction.reply({
           content: `✅ Replay reseteado para <@${target.id}>.`,
           ephemeral: true
@@ -189,27 +198,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      const result = await pool.execute({
-        sql: "SELECT * FROM uploads WHERE user_id = ?",
-        args: [userId]
-      });
-      const replay = result.rows[0];
+      const [rows] = await pool.execute("SELECT * FROM uploads WHERE user_id = ?", [user.id]);
+      const replay = rows[0];
+
       if (!replay)
         return interaction.reply({ content: "❌ Replay no encontrado.", ephemeral: true });
 
       try {
         const replayMsg = await message.channel.messages.fetch(replay.mensaje_replay_id);
         if (customId === "revisado") {
-          await pool.execute({
-            sql: "UPDATE uploads SET revisado = TRUE, ausente = FALSE WHERE user_id = ?",
-            args: [userId]
-          });
+          await pool.execute("UPDATE uploads SET revisado = 1, ausente = 0 WHERE user_id = ?", [
+            userId
+          ]);
           await replayMsg.react("✅");
         } else if (customId === "ausente") {
-          await pool.execute({
-            sql: "UPDATE uploads SET ausente = TRUE, revisado = FALSE WHERE user_id = ?",
-            args: [userId]
-          });
+          await pool.execute("UPDATE uploads SET ausente = 1, revisado = 0 WHERE user_id = ?", [
+            userId
+          ]);
           await replayMsg.react("❌");
         }
 
@@ -236,11 +241,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           content: `📂 Replay recibido de <@${userId}>. Esperando revisión.`,
           components: [row]
         });
-        await pool.execute({
-          sql: "UPDATE uploads SET mensaje_botones_id = ? WHERE user_id = ?",
-          args: [nuevoMsg.id, userId]
-        });
-        return interaction.reply({ content: "⚠️ Botones regenerados.", ephemeral: true });
+        const [result] = await pool.execute(
+          "UPDATE uploads SET mensaje_botones_id = ? WHERE user_id = ?",
+          [nuevoMsg.id, userId]
+        );
+
+        if (result.affectedRows === 0) {
+          console.warn("⚠️ No row updated, user may not exist:", userId);
+        } else {
+          return interaction.reply({ content: "⚠️ Botones regenerados.", ephemeral: true });
+        }
       }
     }
   } catch (err) {
@@ -250,6 +260,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 /* ------------------------------ Message Create ----------------------------- */
 client.on(Events.MessageCreate, async (message) => {
+  console.log("Message create...");
   if (message.author.bot || !message.attachments.size) return;
   if (!BOT_ALLOW_CHANNELS.includes(message.channelId)) return;
 
@@ -257,11 +268,10 @@ client.on(Events.MessageCreate, async (message) => {
   if (!archivo?.name?.endsWith?.(".SC2Replay")) return;
 
   try {
-    const result = await pool.execute({
-      sql: "SELECT * FROM uploads WHERE user_id = ?",
-      args: [message.author.id]
-    });
-    const anterior = result.rows[0];
+    const [rows] = await pool.execute("SELECT * FROM uploads WHERE user_id = ?", [
+      message.author.id
+    ]);
+    const anterior = rows[0];
 
     if (anterior) {
       const tiempo = getTiempoRestante(anterior.fecha);
@@ -286,18 +296,22 @@ client.on(Events.MessageCreate, async (message) => {
       components: [row]
     });
 
-    await pool.execute({
-      sql: `INSERT INTO uploads (user_id, nombre, fecha, revisado, ausente, mensaje_replay_id, mensaje_botones_id)
-            VALUES (?, ?, ?, FALSE, FALSE, ?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET nombre = excluded.nombre,
-                          fecha = excluded.fecha,
-                          revisado = FALSE,
-                          ausente = FALSE,
-                          mensaje_replay_id = excluded.mensaje_replay_id,
-                          mensaje_botones_id = excluded.mensaje_botones_id`,
-      args: [message.author.id, archivo.name, new Date().toISOString(), message.id, botonesMsg.id]
-    });
+    const userName =
+      message.author.globalName ?? message.author.username ?? message.member?.displayName ?? "";
+
+    await pool.execute(
+      `INSERT INTO uploads
+          (user_id, user_name, nombre, fecha, revisado, ausente, mensaje_replay_id, mensaje_botones_id)
+       VALUES (?, ?, ?, ?, 0, 0, ?, ?)
+       ON DUPLICATE KEY UPDATE
+          nombre = VALUES(nombre),
+          fecha = VALUES(fecha),
+          revisado = 0,
+          ausente = 0,
+          mensaje_replay_id = VALUES(mensaje_replay_id),
+          mensaje_botones_id = VALUES(mensaje_botones_id)`,
+      [message.author.id, userName, archivo.name, new Date(), message.id, botonesMsg.id]
+    );
   } catch (err) {
     console.error("❌ Error en MessageCreate:", err);
   }
